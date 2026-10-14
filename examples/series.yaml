@@ -1,0 +1,17 @@
+# One render per series × scene. Paths are relative to this file.
+scenes:
+  - scenes/*.png
+  - path: scenes/rooftop-led.png
+    finish: led
+series:
+  - name: horisont
+    ads:
+      wide: /workspaces/bulkdata/agentics-launch-ooh/creatives/h-wide.png
+      portrait: /workspaces/bulkdata/agentics-launch-ooh/creatives/h-portrait.png
+      landscape: /workspaces/bulkdata/agentics-launch-ooh/creatives/h-landscape.png
+  - name: original
+    ads:
+      wide: /workspaces/bulkdata/agentics-launch-ooh/creatives/agentics-wide.png
+      portrait: /workspaces/bulkdata/agentics-launch-ooh/creatives/agentics-portrait.png
+      landscape: /workspaces/bulkdata/agentics-launch-ooh/creatives/agentics-landscape.png
+output: /workspaces/bulkdata/agentics-launch-ooh/mockups/compositor
