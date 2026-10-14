@@ -5,14 +5,19 @@ import "sort"
 // Surface is one ad slot found in (or pinned for) a scene.
 type Surface struct {
 	Quad Quad `json:"quad" yaml:"quad"`
-	// Aspect is the real width/height of the slot. Zero means: estimate it from the quad.
+	// Format names the media format this slot takes (a key of the series
+	// file's formats). It fixes the slot's real aspect, which the quad alone
+	// cannot: perspective squeezes whichever side recedes. "off" leaves the
+	// slot unfilled — a dark, switched-off screen.
+	Format string `json:"format,omitempty" yaml:"format,omitempty"`
+	// Aspect is the real width/height of the slot. Zero means: take it from the
+	// format, or estimate it from the quad.
 	Aspect float64 `json:"aspect,omitempty" yaml:"aspect,omitempty"`
 	// Finish shapes how the ad sits in the scene: "print" (lit by the scene),
 	// "backlit" (light box) or "led" (emissive screen with bloom). Empty means backlit.
 	Finish string `json:"finish,omitempty" yaml:"finish,omitempty"`
-	// Ad pins a format by name (the file stem, e.g. "portrait"); empty picks by aspect.
-	Ad string `json:"ad,omitempty" yaml:"ad,omitempty"`
-	// Fit is "contain" or "cover"; empty chooses by how far the aspects differ.
+	// Fit is "contain" or "cover", used only when a creative does not match the
+	// slot's aspect; empty chooses by how far the aspects differ.
 	Fit string `json:"fit,omitempty" yaml:"fit,omitempty"`
 }
 

@@ -1,17 +1,41 @@
-# One render per series × scene. Paths are relative to this file.
+# The delivery spec: every media format the scenes contain, and the size a
+# creative for it is delivered in. Each scene's sidecar names its slots' formats.
+formats:
+  strip:     { size: 3840x600,  description: "Long illuminated wall, airport/metro" }
+  rooftop:   { size: 3840x840,  description: "Rooftop LED" }
+  wide:      { size: 2400x1040, description: "Wide screen, bus side" }
+  billboard: { size: 2400x1600, description: "3:2 billboard / banner wrap" }
+  board:     { size: 2400x1800, description: "4:3 megaboard / metro panel" }
+  square:    { size: 1600x1600, description: "Square monitor" }
+  mupi:      { size: 1080x1920, description: "Bus shelter / street screen" }
+  column:    { size: 1080x2400, description: "Freestanding digital column" }
+  banner:    { size: 1000x3200, description: "Hanging fabric banner" }
+
 scenes:
   - scenes/*.png
-  - path: scenes/rooftop-led.png
-    finish: led
+
 series:
   - name: horisont
     ads:
-      wide: /workspaces/bulkdata/agentics-launch-ooh/creatives/h-wide.png
-      portrait: /workspaces/bulkdata/agentics-launch-ooh/creatives/h-portrait.png
-      landscape: /workspaces/bulkdata/agentics-launch-ooh/creatives/h-landscape.png
-  - name: original
+      strip:     creatives/horisont/strip.jpg
+      rooftop:   creatives/horisont/rooftop.jpg
+      wide:      creatives/horisont/wide.jpg
+      billboard: creatives/horisont/billboard.jpg
+      board:     creatives/horisont/board.jpg
+      square:    creatives/horisont/square.jpg
+      mupi:      creatives/horisont/mupi.jpg
+      column:    creatives/horisont/column.jpg
+      banner:    creatives/horisont/banner.jpg
+
+  - name: dag-40
     ads:
-      wide: /workspaces/bulkdata/agentics-launch-ooh/creatives/agentics-wide.png
-      portrait: /workspaces/bulkdata/agentics-launch-ooh/creatives/agentics-portrait.png
-      landscape: /workspaces/bulkdata/agentics-launch-ooh/creatives/agentics-landscape.png
-output: /workspaces/bulkdata/agentics-launch-ooh/mockups/compositor
+      strip:     creatives/dag-40/strip.jpg
+      rooftop:   creatives/dag-40/rooftop.jpg
+      wide:      creatives/dag-40/wide.jpg
+      billboard: creatives/dag-40/billboard.jpg
+      board:     creatives/dag-40/board.jpg
+      square:    creatives/dag-40/square.jpg
+      mupi:      creatives/dag-40/mupi.jpg
+      column:    creatives/dag-40/column.jpg
+      banner:    creatives/dag-40/banner.jpg
+output: ../out

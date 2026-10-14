@@ -1,14 +1,18 @@
 // Command mockup places a series of ad creatives into chroma-keyed reference
 // scenes — deterministic compositing, no AI at render time.
 //
-//	mockup detect scene.png...      write scene.surfaces.json next to each scene
-//	mockup render series.yaml       render every series × scene into the output dir
+//	mockup detect scene.png...              write scene.surfaces.json next to each scene
+//	mockup formats series.yaml [--assign]   the delivery spec: which formats, what sizes, what is missing
+//	mockup render series.yaml               render every series × scene into the output dir
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"html"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -18,63 +22,21 @@ import (
 	"sync"
 
 	"github.com/pksorensen/pks-agent-mockup/internal/compose"
-	"gopkg.in/yaml.v3"
 )
 
-// Config is the series file.
-type Config struct {
-	// Scenes are scene images or globs. Each may carry a sidecar
-	// <scene>.surfaces.json (from `mockup detect`, hand-editable); without one
-	// the surfaces are detected on the fly.
-	Scenes []SceneRef `yaml:"scenes"`
-	// Series are named ad sets, e.g. one per campaign week. Each maps a format
-	// name to a creative; a surface gets the format whose aspect fits it best.
-	Series  []Series `yaml:"series"`
-	Output  string   `yaml:"output"`
-	Format  string   `yaml:"format"` // jpg (default) or png
-	Quality int      `yaml:"quality"`
-	Key     *struct {
-		Low, High float32
-		MinArea   float64 `yaml:"minArea"`
-	} `yaml:"key"`
-	Look *struct{ Bloom, Grain float32 } `yaml:"look"`
-}
-
-type SceneRef struct {
-	Path   string `yaml:"path"`
-	Finish string `yaml:"finish"` // default finish for this scene's surfaces
-}
-
-// UnmarshalYAML accepts a bare path string as well as the mapping form.
-func (s *SceneRef) UnmarshalYAML(n *yaml.Node) error {
-	if n.Kind == yaml.ScalarNode {
-		s.Path = n.Value
-		return nil
-	}
-	type plain SceneRef
-	return n.Decode((*plain)(s))
-}
-
-type Series struct {
-	Name string            `yaml:"name"`
-	Ads  map[string]string `yaml:"ads"`
-}
-
-// Sidecar is the hand-editable surface list for one scene.
-type Sidecar struct {
-	Finish   string            `json:"finish,omitempty"`
-	Surfaces []compose.Surface `json:"surfaces"`
-}
+var imageDecodeConfig = func(r io.Reader) (image.Config, string, error) { return image.DecodeConfig(r) }
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: mockup detect <scene.png>... | mockup render <series.yaml>")
+		fmt.Fprintln(os.Stderr, "usage: mockup detect <scene.png>... | mockup formats <series.yaml> [--assign] | mockup render <series.yaml>")
 		os.Exit(2)
 	}
 	var err error
 	switch os.Args[1] {
 	case "detect":
 		err = detect(os.Args[2:])
+	case "formats":
+		err = formats(os.Args[2], len(os.Args) > 3 && os.Args[3] == "--assign")
 	case "render":
 		err = render(os.Args[2])
 	default:
@@ -86,10 +48,6 @@ func main() {
 	}
 }
 
-func sidecarPath(scene string) string {
-	return strings.TrimSuffix(scene, filepath.Ext(scene)) + ".surfaces.json"
-}
-
 func detect(scenes []string) error {
 	for _, p := range scenes {
 		img, err := compose.Load(p)
@@ -97,11 +55,7 @@ func detect(scenes []string) error {
 			return err
 		}
 		sc := Sidecar{Surfaces: compose.DefaultKey.Detect(img)}
-		for i := range sc.Surfaces {
-			round(&sc.Surfaces[i].Quad)
-		}
-		b, _ := json.MarshalIndent(sc, "", "  ")
-		if err := os.WriteFile(sidecarPath(p), append(b, '\n'), 0o644); err != nil {
+		if err := writeSidecar(p, sc); err != nil {
 			return err
 		}
 		fmt.Printf("%s: %d surfaces\n", p, len(sc.Surfaces))
@@ -109,92 +63,194 @@ func detect(scenes []string) error {
 	return nil
 }
 
-func round(q *compose.Quad) {
-	for i := range q {
-		q[i].X, q[i].Y = math.Round(q[i].X), math.Round(q[i].Y)
+// problem is one thing standing between the series file and a render.
+type problem struct{ msg string }
+
+// check validates the project: every slot has a known format, and every series
+// delivers a creative of the right aspect for every format the scenes use.
+func (p *Project) check() (used map[string][]string, probs []problem) {
+	used = map[string][]string{} // format → "scene#slot"
+	for _, sc := range p.Scenes {
+		if !sc.HasCar {
+			probs = append(probs, problem{fmt.Sprintf("%s: no sidecar — run `mockup detect %s`", sc.Name, sc.Path)})
+			continue
+		}
+		for i, s := range sc.Sidecar.Surfaces {
+			switch {
+			case s.Format == "off":
+			case s.Format == "":
+				probs = append(probs, problem{fmt.Sprintf("%s#%d: no format (closest by shape: %s) — `mockup formats --assign` fills in suggestions", sc.Name, i, p.nearestFormat(s))})
+			case p.Formats[s.Format].W == 0:
+				probs = append(probs, problem{fmt.Sprintf("%s#%d: format %q is not defined under formats:", sc.Name, i, s.Format)})
+			default:
+				used[s.Format] = append(used[s.Format], fmt.Sprintf("%s#%d", sc.Name, i))
+			}
+		}
 	}
+	for _, se := range p.Series {
+		for _, name := range sortedKeys(used) {
+			spec := p.Formats[name]
+			path, ok := se.Ads[name]
+			if !ok {
+				probs = append(probs, problem{fmt.Sprintf("series %s: missing %s (%dx%d)", se.Name, name, spec.W, spec.H)})
+				continue
+			}
+			w, h, err := imageSize(p.rel(path))
+			if err != nil {
+				probs = append(probs, problem{fmt.Sprintf("series %s: %v", se.Name, err)})
+				continue
+			}
+			if math.Abs(math.Log(float64(w)/float64(h)/spec.Aspect())) > 0.01 && p.Fit == "" {
+				probs = append(probs, problem{fmt.Sprintf("series %s: %s is %dx%d, format %s wants %dx%d (or set fit: contain|cover)", se.Name, filepath.Base(path), w, h, name, spec.W, spec.H)})
+			} else if w < spec.W*3/4 {
+				fmt.Fprintf(os.Stderr, "warning: series %s: %s is %dx%d, below the %dx%d spec\n", se.Name, filepath.Base(path), w, h, spec.W, spec.H)
+			}
+		}
+	}
+	return used, probs
+}
+
+func formats(cfgPath string, assign bool) error {
+	p, err := load(cfgPath)
+	if err != nil {
+		return err
+	}
+	if assign {
+		for _, sc := range p.Scenes {
+			if !sc.HasCar {
+				continue
+			}
+			changed := false
+			for i := range sc.Sidecar.Surfaces {
+				if sc.Sidecar.Surfaces[i].Format == "" {
+					sc.Sidecar.Surfaces[i].Format = p.nearestFormat(sc.Sidecar.Surfaces[i])
+					changed = true
+				}
+			}
+			if changed {
+				if err := writeSidecar(sc.Path, sc.Sidecar); err != nil {
+					return err
+				}
+				fmt.Printf("assigned formats in %s — check them, perspective fools the guess\n", sidecarPath(sc.Path))
+			}
+		}
+	}
+	used, probs := p.check()
+
+	fmt.Println("Delivery spec — one creative per format, per series:")
+	fmt.Println()
+	fmt.Printf("  %-12s %-11s %-6s %s\n", "FORMAT", "SIZE", "RATIO", "SLOTS")
+	for _, name := range p.formatNames() {
+		spec := p.Formats[name]
+		slots := used[name]
+		if len(slots) == 0 {
+			continue
+		}
+		fmt.Printf("  %-12s %-11s %-6s %d  %s\n", name, spec.Size, ratio(spec.W, spec.H), len(slots), summarize(slots))
+		if spec.Description != "" {
+			fmt.Printf("  %-12s %s\n", "", spec.Description)
+		}
+	}
+	for _, name := range p.formatNames() {
+		if len(used[name]) == 0 {
+			fmt.Printf("  (%s is defined but no scene uses it)\n", name)
+		}
+	}
+	fmt.Println()
+	if len(probs) == 0 {
+		fmt.Printf("All %d series deliver every format. Ready to render.\n", len(p.Series))
+		return nil
+	}
+	fmt.Printf("%d problem(s):\n", len(probs))
+	for _, pr := range probs {
+		fmt.Println("  -", pr.msg)
+	}
+	return fmt.Errorf("not ready to render")
+}
+
+func ratio(w, h int) string {
+	r := float64(w) / float64(h)
+	if r >= 1 {
+		return fmt.Sprintf("%.2g:1", r)
+	}
+	return fmt.Sprintf("1:%.2g", 1/r)
+}
+
+// summarize lists the scenes a format appears in, collapsing slot numbers.
+func summarize(slots []string) string {
+	count := map[string]int{}
+	var order []string
+	for _, s := range slots {
+		name, _, _ := strings.Cut(s, "#")
+		if count[name] == 0 {
+			order = append(order, name)
+		}
+		count[name]++
+	}
+	parts := make([]string, len(order))
+	for i, n := range order {
+		parts[i] = n
+		if count[n] > 1 {
+			parts[i] = fmt.Sprintf("%s ×%d", n, count[n])
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type job struct {
-	scene  string
-	finish string
+	scene  Scene
 	series Series
 	out    string
 }
 
 func render(cfgPath string) error {
-	raw, err := os.ReadFile(cfgPath)
+	p, err := load(cfgPath)
 	if err != nil {
 		return err
 	}
-	var cfg Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return fmt.Errorf("%s: %w", cfgPath, err)
-	}
-	base := filepath.Dir(cfgPath)
-	rel := func(p string) string {
-		if filepath.IsAbs(p) {
-			return p
+	if _, probs := p.check(); len(probs) > 0 {
+		for _, pr := range probs {
+			fmt.Fprintln(os.Stderr, "  -", pr.msg)
 		}
-		return filepath.Join(base, p)
+		return fmt.Errorf("%d problem(s); `mockup formats %s` shows the delivery spec", len(probs), cfgPath)
 	}
 	key, look := compose.DefaultKey, compose.DefaultLook
-	if cfg.Key != nil {
-		key = compose.Key{Low: cfg.Key.Low, High: cfg.Key.High, MinArea: cfg.Key.MinArea}
+	if p.Key != nil {
+		key = compose.Key{Low: p.Key.Low, High: p.Key.High, MinArea: p.Key.MinArea}
 	}
-	if cfg.Look != nil {
-		look = compose.Look{Bloom: cfg.Look.Bloom, Grain: cfg.Look.Grain}
+	if p.Look != nil {
+		look = compose.Look{Bloom: p.Look.Bloom, Grain: p.Look.Grain}
 	}
-	if cfg.Format == "" {
-		cfg.Format = "jpg"
-	}
-	if cfg.Quality == 0 {
-		cfg.Quality = 90
-	}
-	out := rel(cfg.Output)
-	if cfg.Output == "" {
-		out = rel("out")
-	}
-
-	// Expand scene globs.
-	var scenes []SceneRef
-	seen := map[string]int{}
-	for _, s := range cfg.Scenes {
-		matches, err := filepath.Glob(rel(s.Path))
-		if err != nil || len(matches) == 0 {
-			return fmt.Errorf("scene %q matched nothing", s.Path)
-		}
-		sort.Strings(matches)
-		for _, m := range matches {
-			if i, ok := seen[m]; ok {
-				scenes[i].Finish = s.Finish // a later, more specific entry wins
-				continue
-			}
-			seen[m] = len(scenes)
-			scenes = append(scenes, SceneRef{Path: m, Finish: s.Finish})
-		}
-	}
+	out := p.rel(p.Output)
 
 	// Load each creative once; series share files freely.
 	ads := map[string]*compose.Raster{}
-	for _, se := range cfg.Series {
-		for _, p := range se.Ads {
-			if _, ok := ads[rel(p)]; ok {
+	for _, se := range p.Series {
+		for _, path := range se.Ads {
+			if _, ok := ads[p.rel(path)]; ok {
 				continue
 			}
-			r, err := compose.Load(rel(p))
+			r, err := compose.Load(p.rel(path))
 			if err != nil {
 				return err
 			}
-			ads[rel(p)] = r
+			ads[p.rel(path)] = r
 		}
 	}
 
 	var jobs []job
-	for _, se := range cfg.Series {
-		for _, sc := range scenes {
-			stem := strings.TrimSuffix(filepath.Base(sc.Path), filepath.Ext(sc.Path))
-			jobs = append(jobs, job{sc.Path, sc.Finish, se, filepath.Join(out, se.Name, stem+"."+cfg.Format)})
+	for _, se := range p.Series {
+		for _, sc := range p.Scenes {
+			jobs = append(jobs, job{sc, se, filepath.Join(out, se.Name, sc.Name+"."+p.ImageType)})
 		}
 	}
 
@@ -209,7 +265,7 @@ func render(cfgPath string) error {
 		go func() {
 			defer wg.Done()
 			for j := range ch {
-				err := renderOne(j, key, look, ads, rel, cfg.Quality)
+				err := p.renderOne(j, key, look, ads)
 				mu.Lock()
 				if err != nil && firstErr == nil {
 					firstErr = err
@@ -229,59 +285,44 @@ func render(cfgPath string) error {
 	if firstErr != nil {
 		return firstErr
 	}
-	return writeIndex(out, cfg.Series, scenes, cfg.Format)
+	return writeIndex(out, p.Series, p.Scenes, p.ImageType)
 }
 
-func renderOne(j job, key compose.Key, look compose.Look, ads map[string]*compose.Raster, rel func(string) string, quality int) error {
-	scene, err := compose.Load(j.scene)
+func (p *Project) renderOne(j job, key compose.Key, look compose.Look, ads map[string]*compose.Raster) error {
+	scene, err := compose.Load(j.scene.Path)
 	if err != nil {
 		return err
 	}
-	var sc Sidecar
-	if b, err := os.ReadFile(sidecarPath(j.scene)); err == nil {
-		if err := json.Unmarshal(b, &sc); err != nil {
-			return fmt.Errorf("%s: %w", sidecarPath(j.scene), err)
+	finish := j.scene.Finish
+	if j.scene.Sidecar.Finish != "" {
+		finish = j.scene.Sidecar.Finish
+	}
+	surfaces := append([]compose.Surface(nil), j.scene.Sidecar.Surfaces...)
+	for i := range surfaces {
+		s := &surfaces[i]
+		if s.Finish == "" {
+			s.Finish = finish
 		}
-	} else {
-		sc.Surfaces = key.Detect(scene)
-	}
-	finish := j.finish
-	if sc.Finish != "" {
-		finish = sc.Finish
-	}
-	for i := range sc.Surfaces {
-		if sc.Surfaces[i].Finish == "" {
-			sc.Surfaces[i].Finish = finish
+		if s.Aspect == 0 && s.Format != "off" {
+			s.Aspect = p.Formats[s.Format].Aspect()
+		}
+		if s.Fit == "" {
+			s.Fit = p.Fit
 		}
 	}
 	pick := func(s compose.Surface) *compose.Raster {
-		if s.Ad != "" {
-			if p, ok := j.series.Ads[s.Ad]; ok {
-				return ads[rel(p)]
-			}
+		if s.Format == "off" {
+			return nil
 		}
-		w, h := s.Quad.Size()
-		want := s.Aspect
-		if want == 0 {
-			want = w / h
-		}
-		var best *compose.Raster
-		bestD := math.Inf(1)
-		for _, p := range j.series.Ads {
-			r := ads[rel(p)]
-			if d := math.Abs(math.Log(float64(r.W) / float64(r.H) / want)); d < bestD {
-				best, bestD = r, d
-			}
-		}
-		return best
+		return ads[p.rel(j.series.Ads[s.Format])]
 	}
-	seed := int64(len(j.scene)*7919 + len(j.series.Name))
-	res := compose.Composite(scene, key, sc.Surfaces, pick, look, seed)
-	return compose.Save(res, j.out, quality)
+	seed := int64(len(j.scene.Path)*7919 + len(j.series.Name))
+	res := compose.Composite(scene, key, surfaces, pick, look, seed)
+	return compose.Save(res, j.out, p.Quality)
 }
 
 // writeIndex drops a plain contact sheet next to the renders.
-func writeIndex(out string, series []Series, scenes []SceneRef, format string) error {
+func writeIndex(out string, series []Series, scenes []Scene, imageType string) error {
 	var b strings.Builder
 	b.WriteString(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mockup series</title>
 <style>body{margin:0;padding:16px;font:14px system-ui;background:#111;color:#eee}h2{font-weight:500;margin:24px 0 8px}
@@ -289,9 +330,8 @@ func writeIndex(out string, series []Series, scenes []SceneRef, format string) e
 	for _, se := range series {
 		fmt.Fprintf(&b, "<h2>%s</h2><div class=g>", html.EscapeString(se.Name))
 		for _, sc := range scenes {
-			stem := strings.TrimSuffix(filepath.Base(sc.Path), filepath.Ext(sc.Path))
-			src := se.Name + "/" + stem + "." + format
-			fmt.Fprintf(&b, `<a href="%s"><img loading=lazy src="%s" alt="%s"></a>`, src, src, html.EscapeString(stem))
+			src := se.Name + "/" + sc.Name + "." + imageType
+			fmt.Fprintf(&b, `<a href="%s"><img loading=lazy src="%s" alt="%s"></a>`, src, src, html.EscapeString(sc.Name))
 		}
 		b.WriteString("</div>")
 	}
